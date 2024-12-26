@@ -18,9 +18,9 @@ import OSLog
  */
 public class AECAudioStream {
   
-  private(set) var audioUnit: AudioUnit?
+  private(set) var audioUnit: AudioUnit!
   
-  private(set) var graph: AUGraph?
+  private(set) var graph: AUGraph!
   
   private(set) var streamBasicDescription: AudioStreamBasicDescription
   
@@ -39,6 +39,8 @@ public class AECAudioStream {
   public var enableRendererCallback: Bool = false
   
   private(set) var capturedFrameHandler: ((AVAudioPCMBuffer) -> Void)?
+  
+  private(set) var running = false
   
   /**
    Initializes an instance of an audio stream object with the specified sample rate.
@@ -66,29 +68,23 @@ public class AECAudioStream {
    
    - Parameter enableAEC: A Boolean value that indicates whether to enable the AEC filter.
    
-   - Parameter enableRendererCallback: A Boolean value that indicates whether to enable a renderer callback, if enabled data provided in `rendererClosure` will be send to speaker
-   
-   - Parameter rendererClosure: A closure that takes an `UnsafeMutablePointer<AudioBufferList>` and a `UInt32` as input.
-   
    - Returns: An `AsyncThrowingStream` that yields `AVAudioPCMBuffer` objects containing the captured audio data.
    
    - Throws: An error if there was a problem creating or configuring the audio unit, or if the AEC filter could not be enabled.
    */
-  public func startAudioStream(enableAEC: Bool,
-                               enableRendererCallback: Bool = false,
-                               rendererClosure: ((UnsafeMutablePointer<AudioBufferList>, UInt32) -> Void)? = nil) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
+  public func startAudioStream(enableAEC: Bool, enableAdvancedDucking: Bool = false, duckingLevel: AUVoiceIOOtherAudioDuckingLevel = .default) -> AsyncThrowingStream<AVAudioPCMBuffer, Error> {
     AsyncThrowingStream<AVAudioPCMBuffer, Error> { continuation in
       do {
-        
-        self.enableRendererCallback = enableRendererCallback
-        self.rendererClosure = rendererClosure
-        self.capturedFrameHandler = {continuation.yield($0)}
-        
         try createAUGraphForAudioUnit()
         try configureAudioUnit()
         try toggleAudioCancellation(enable: enableAEC)
+        if enableAEC {
+          if #available(macOS 14, *) { try configureAudioDucking(advanced: enableAdvancedDucking, level: duckingLevel) }
+        }
         try startGraph()
         try startAudioUnit()
+        self.capturedFrameHandler = {continuation.yield($0)}
+        self.running = true
       } catch {
         continuation.finish(throwing: error)
       }
@@ -106,16 +102,17 @@ public class AECAudioStream {
    
    - Throws: An error if there was a problem creating or configuring the audio unit, or if the AEC filter could not be enabled.
    */
-  public func startAudioStream(enableAEC: Bool,
-                               enableRendererCallback: Bool = false,
-                               rendererClosure: ((UnsafeMutablePointer<AudioBufferList>, UInt32) -> Void)? = nil) throws {
-    self.enableRendererCallback = enableRendererCallback
+  public func startAudioStream(enableAEC: Bool, enableAdvancedDucking: Bool = false, duckingLevel: AUVoiceIOOtherAudioDuckingLevel = .default, audioBufferHandler: @escaping (AVAudioPCMBuffer) -> Void ) throws {
     try createAUGraphForAudioUnit()
     try configureAudioUnit()
     try toggleAudioCancellation(enable: enableAEC)
+    if enableAEC {
+      if #available(macOS 14, *) { try configureAudioDucking(advanced: enableAdvancedDucking, level: duckingLevel) }
+    }
     try startGraph()
     try startAudioUnit()
-    self.rendererClosure = rendererClosure
+    self.capturedFrameHandler = audioBufferHandler
+    self.running = true
   }
   
   /**
@@ -141,10 +138,20 @@ public class AECAudioStream {
       logger.error("DisposeAUGraph failed")
       throw AECAudioStreamError.osStatusError(status: status)
     }
+    self.running = false
+  }
+  
+  private func configureAudioDucking(advanced: Bool, level: AUVoiceIOOtherAudioDuckingLevel) throws {
+    var duckingConfig = AUVoiceIOOtherAudioDuckingConfiguration(mEnableAdvancedDucking: DarwinBoolean(advanced), mDuckingLevel: level)
+    let status = AudioUnitSetProperty(audioUnit, kAUVoiceIOProperty_OtherAudioDuckingConfiguration, kAudioUnitScope_Global, 0, &duckingConfig, UInt32(MemoryLayout.size(ofValue: duckingConfig)))
+
+    guard status == noErr else {
+      logger.error("Error in AUVoiceIOOtherAudioDuckingConfiguration")
+      throw AECAudioStreamError.osStatusError(status: status)
+    }
   }
   
   private func toggleAudioCancellation(enable: Bool) throws {
-    guard let audioUnit = audioUnit else {return}
     self.enableAutomaticEchoCancellation = enable
     // 0 means feature is enabled, which includes built-in echo cancellation. When the property is set to true, the voice processing feature is bypassed and no echo cancellation is performed.
     var bypassVoiceProcessing: UInt32 = self.enableAutomaticEchoCancellation ? 0 : 1
@@ -167,8 +174,7 @@ public class AECAudioStream {
   }
   
   private func startAudioUnit() throws {
-    guard let audioUnit = audioUnit else {return}
-    let status = AudioOutputUnitStart(audioUnit)
+    let status = AudioOutputUnitStart(audioUnit!)
     guard AudioOutputUnitStart(audioUnit) == noErr else {
       throw AECAudioStreamError.osStatusError(status: status)
     }
@@ -229,8 +235,7 @@ public class AECAudioStream {
   
   
   private func configureAudioUnit() throws {
-    guard let audioUnit = audioUnit else {return}
-    // Bus 0 provides output to hardware and bus 1 accepts input from hardware. See the Voice-Processing I/O Audio Unit Properties(`kAudioUnitSubType_VoiceProcessingIO`) for the identifiers for this audio unit’s properties.
+    // Bus 0 provides output to hardware and bus 1 accepts input from hardware. See the Voice-Processing I/O Audio Unit Properties(`kAudioUnitSubType_VoiceProcessingIO`) for the identifiers for this audio unit’s properties. 
     let bus_0_output: AudioUnitElement = 0
     let bus_1_input: AudioUnitElement = 1
     
@@ -298,22 +303,22 @@ private func kInputCallback(inRefCon:UnsafeMutableRawPointer,
   
   let audioMgr = unsafeBitCast(inRefCon, to: AECAudioStream.self)
   
-  guard let audioUnit = audioMgr.audioUnit else {
-    return kAudio_ParamError
+  guard audioMgr.running else {
+    return noErr
   }
   
   let audioBuffer = AudioBuffer(mNumberChannels: 1, mDataByteSize: 0, mData: nil)
   
   var bufferList = AudioBufferList(mNumberBuffers: 1, mBuffers: audioBuffer)
   
-  let status = AudioUnitRender(audioUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
+  let status = AudioUnitRender(audioMgr.audioUnit, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
   
   guard status == noErr else { return status }
   
   if let buffer = AVAudioPCMBuffer(pcmFormat: audioMgr.streamFormat, bufferListNoCopy: &bufferList), let captureAudioFrameHandler = audioMgr.capturedFrameHandler {
     captureAudioFrameHandler(buffer)
   }
-  return kAudio_ParamError
+  return noErr
 }
 
 private func kRenderCallback(inRefCon:UnsafeMutableRawPointer,
@@ -325,18 +330,10 @@ private func kRenderCallback(inRefCon:UnsafeMutableRawPointer,
   
   let audioMgr = unsafeBitCast(inRefCon, to: AECAudioStream.self)
   
-  guard let outSample = ioData?.pointee.mBuffers.mData?.assumingMemoryBound(to: Int16.self) else {
-    return kAudio_ParamError
-  }
-  let bufferLength = ioData!.pointee.mBuffers.mDataByteSize / UInt32(MemoryLayout<Int16>.stride)
-  // Zero out buffers
-  memset(outSample, 0, Int(bufferLength))
-          
   if let rendererClosure = audioMgr.rendererClosure {
     rendererClosure(ioData!, inNumberFrames)
   } else {
-    // Renderer callback enabled but not renderrerClosure is assigned.
-    return kAudioUnitErr_InvalidParameter
+    fatalError("Renderer callback enabled but not renderrerClosure is assigned.")
   }
   
   return noErr
